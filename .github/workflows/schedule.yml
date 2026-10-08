@@ -1,0 +1,34 @@
+# Положить в репозиторий по пути:  .github/workflows/schedule.yml
+# Рядом, в корне репозитория, должен лежать rea_schedule_to_ics.py
+name: Update schedule
+
+on:
+  schedule:
+    - cron: "0 4 * * *"   # раз в сутки, 07:00 по Москве
+  workflow_dispatch:       # + кнопка ручного запуска во вкладке Actions
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install beautifulsoup4
+
+      # Если ничего не нашлось, скрипт завершится с ошибкой
+      # и старый schedule.ics останется нетронутым.
+      - run: python rea_schedule_to_ics.py --alarm 30 --out schedule.ics
+
+      - name: Commit result
+        run: |
+          git config user.name "schedule-bot"
+          git config user.email "schedule-bot@users.noreply.github.com"
+          git add schedule.ics
+          git diff --cached --quiet || (git commit -m "Update schedule" && git push)
