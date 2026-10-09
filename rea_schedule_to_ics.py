@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """rasp.rea.ru -> schedule.ics
 
-Забирает расписание группы с rasp.rea.ru (эндпоинт /Schedule/ScheduleCard)
-и собирает календарь iCalendar, на который можно подписаться с iPhone.
+Забирает расписание группы с rasp.rea.ru (/Schedule/ScheduleCard), добавляет
+преподавателей (/Schedule/GetDetails) и собирает календарь iCalendar, на который
+можно подписаться с iPhone.
+
+Преподаватели:
+  * для каждой пары «предмет + тип занятия» ищутся один раз и кладутся в
+    teachers_cache.json (обновляется раз в 30 дней);
+  * занятия ближайших 14 дней перепроверяются при каждом запуске (замены).
 
 Зависимости:  pip install beautifulsoup4
 
 Примеры:
-  python rea_schedule_to_ics.py                       # вся осень, weekNum 1..22
+  python rea_schedule_to_ics.py                        # недели 1..45
   python rea_schedule_to_ics.py --from-week 6 --to-week 18 --alarm 30
-  python rea_schedule_to_ics.py --from-file week.html # проверка на сохранённом HTML
+  python rea_schedule_to_ics.py --no-teachers          # без преподавателей
+  python rea_schedule_to_ics.py --from-file week.html  # проверка на сохранённом HTML
 """
 import argparse
+import json
+import os
 import re
 import sys
 import time
@@ -20,27 +29,42 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
-BASE_URL = "https://rasp.rea.ru/Schedule/ScheduleCard"
+SITE = "https://rasp.rea.ru"
+CARD_URL = f"{SITE}/Schedule/ScheduleCard"
+DETAILS_URL = f"{SITE}/Schedule/GetDetails"
 DEFAULT_GROUP = "15.27д-би06/25м"
 MSK = timezone(timedelta(hours=3))  # Москва: UTC+3 круглый год
+PAUSE = 1.0  # секунд между запросами к сайту
+
+
+def today():
+    return datetime.now(MSK).date()
 
 
 # ---------- загрузка ----------
 
-def fetch_week(group, week):
-    query = urllib.parse.urlencode({"selection": group, "weekNum": week, "catfilter": 0})
+def http_get(url, params):
     req = urllib.request.Request(
-        f"{BASE_URL}?{query}",
+        f"{url}?{urllib.parse.urlencode(params)}",
         headers={
+            # заголовки HTTP — только латиница
             "User-Agent": "Mozilla/5.0 (personal schedule sync)",
             "X-Requested-With": "XMLHttpRequest",
-            "Referer": "https://rasp.rea.ru/",
+            "Referer": f"{SITE}/",
         },
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+
+def fetch_week(group, week):
+    return http_get(CARD_URL, {"selection": group, "weekNum": week, "catfilter": 0})
+
+
+def fetch_details(group, day, pair):
+    return http_get(DETAILS_URL, {"selection": group, "date": f"{day:%d.%m.%Y}", "timeSlot": pair})
 
 
 # ---------- разбор ----------
@@ -96,6 +120,29 @@ def parse_week(html):
     return lessons
 
 
+def parse_details(html):
+    """Преподаватели из окна с подробностями: [[ФИО, кафедра], ...]."""
+    soup = BeautifulSoup(html, "html.parser")
+    teachers = []
+    for a in soup.select('a[href^="?q="]'):
+        for icon in a.select("i"):  # иконка material-icons: текст «school»
+            icon.decompose()
+        name = " ".join(a.get_text(" ", strip=True).split())
+        if not name:
+            continue
+        dept = ""
+        for sib in a.next_siblings:  # «(Кафедра ...)» стоит сразу после ссылки
+            if isinstance(sib, Tag) and sib.name == "a":
+                break
+            text = sib.get_text(" ") if isinstance(sib, Tag) else str(sib)
+            m = re.search(r"\(([^()]+)\)", text)
+            if m:
+                dept = " ".join(m.group(1).split())
+                break
+        teachers.append([name, dept])
+    return teachers
+
+
 def merge_adjacent(lessons):
     """Склеивает подряд идущие пары одного предмета (7+8 -> один слот 18:55-22:00)."""
     out = []
@@ -108,6 +155,63 @@ def merge_adjacent(lessons):
         else:
             out.append({**l, "last_pair": l["pair"]})
     return out
+
+
+# ---------- преподаватели ----------
+
+def cache_key(l):
+    return f"{l['title']} | {l['kind']}"
+
+
+def attach_teachers(lessons, group, cache, refresh_days=14, cache_days=30):
+    """Дописывает l['teachers'] каждому занятию. Возвращает число запросов к сайту."""
+    now = today()
+    near_end = now + timedelta(days=refresh_days)
+    memo = {}
+
+    def lookup(l):
+        slot = (l["date"], l["pair"])
+        if slot not in memo:
+            try:
+                memo[slot] = parse_details(fetch_details(group, l["date"], l["pair"]))
+            except Exception as e:  # сайт ответил ошибкой — просто идём дальше
+                print(f"преподаватель {l['date']:%d.%m} пара {l['pair']}: {e}", file=sys.stderr)
+                memo[slot] = []
+            time.sleep(PAUSE)
+        return memo[slot]
+
+    by_key = {}
+    for l in lessons:
+        by_key.setdefault(cache_key(l), []).append(l)
+
+    # 1) пополняем кэш: один запрос на каждую пару «предмет + тип»
+    for k, items in by_key.items():
+        entry = cache.get(k)
+        if entry and (now - date.fromisoformat(entry["updated"])).days <= cache_days:
+            continue
+        upcoming = [l for l in items if l["date"] >= now]
+        teachers = lookup((upcoming or items)[0])
+        if teachers:
+            cache[k] = {"teachers": teachers, "updated": now.isoformat()}
+
+    # 2) ближайшие дни смотрим по каждому занятию (замены), остальные — из кэша
+    for l in lessons:
+        own = lookup(l) if now <= l["date"] <= near_end else []
+        l["teachers"] = own or cache.get(cache_key(l), {}).get("teachers", [])
+    return len(memo)
+
+
+def load_cache(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cache(path, cache):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=1, sort_keys=True)
 
 
 # ---------- iCalendar ----------
@@ -146,8 +250,14 @@ def build_ics(lessons, alarm_min=0):
         "X-PUBLISHED-TTL:PT6H",
     ]
     for l in lessons:
-        first, last = l.get("first_pair", l["pair"]), l.get("last_pair", l["pair"])
-        pairs = f"Пара {first}" if first == last else f"Пары {first}–{last}"
+        first, last = l["pair"], l.get("last_pair", l["pair"])
+        desc = [f"Пара {first}" if first == last else f"Пары {first}–{last}"]
+        teachers = l.get("teachers") or []
+        if teachers:
+            names = "; ".join(f"{n} ({d})" if d else n for n, d in teachers)
+            desc.append(("Преподаватели: " if len(teachers) > 1 else "Преподаватель: ") + names)
+        description = "\n".join(desc)
+
         summary = f"{l['title']} ({l['kind']})" if l["kind"] else l["title"]
         uid = f"{l['eid'] or l['pair']}-{l['date']:%Y%m%d}@rasp.rea.ru"
         lines += [
@@ -158,7 +268,7 @@ def build_ics(lessons, alarm_min=0):
             f"DTEND:{utc(l['date'], l['end'])}",
             f"SUMMARY:{esc(summary)}",
             f"LOCATION:{esc(l['place'])}",
-            f"DESCRIPTION:{esc(pairs)}",
+            f"DESCRIPTION:{esc(description)}",
         ]
         if alarm_min:
             lines += [
@@ -179,10 +289,14 @@ def main():
     ap = argparse.ArgumentParser(description="rasp.rea.ru -> .ics")
     ap.add_argument("--group", default=DEFAULT_GROUP)
     ap.add_argument("--from-week", type=int, default=1)
-    ap.add_argument("--to-week", type=int, default=22)
+    ap.add_argument("--to-week", type=int, default=45)
     ap.add_argument("--out", default="schedule.ics")
     ap.add_argument("--no-merge", action="store_true", help="не склеивать подряд идущие пары")
     ap.add_argument("--alarm", type=int, default=0, help="напоминание за N минут (0 = без)")
+    ap.add_argument("--no-teachers", action="store_true", help="не искать преподавателей")
+    ap.add_argument("--cache", default="teachers_cache.json", help="файл кэша преподавателей")
+    ap.add_argument("--refresh-days", type=int, default=14,
+                    help="сколько ближайших дней перепроверять преподавателей каждый запуск")
     ap.add_argument("--from-file", help="разобрать сохранённый HTML вместо похода на сайт")
     args = ap.parse_args()
 
@@ -196,12 +310,20 @@ def main():
                 found += parse_week(fetch_week(args.group, week))
             except Exception as e:  # сайт лёг / сменилась вёрстка — идём дальше
                 print(f"неделя {week}: {e}", file=sys.stderr)
-            time.sleep(1)  # не нагружаем сайт
+            time.sleep(PAUSE)
 
-    unique = {(l["date"], l["pair"]): l for l in found}.values()
-    lessons = list(unique) if args.no_merge else merge_adjacent(unique)
+    unique = sorted({(l["date"], l["pair"]): l for l in found}.values(),
+                    key=lambda x: (x["date"], x["pair"]))
+    lessons = unique if args.no_merge else merge_adjacent(unique)
     if not lessons:
         sys.exit("Не найдено ни одного занятия — .ics не перезаписан.")
+
+    if not args.no_teachers and not args.from_file:
+        cache = load_cache(args.cache)
+        requests_made = attach_teachers(lessons, args.group, cache, args.refresh_days)
+        save_cache(args.cache, cache)
+        missing = sum(1 for l in lessons if not l.get("teachers"))
+        print(f"Преподаватели: {requests_made} запросов, без преподавателя: {missing} из {len(lessons)}")
 
     with open(args.out, "w", encoding="utf-8", newline="") as f:
         f.write(build_ics(lessons, args.alarm))
