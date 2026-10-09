@@ -1,4 +1,4 @@
-# Положить в репозиторий по пути:  .github/workflows/schedule.yml
+# Положить в репозиторий по пути:  .github/workflows/schedule.yml  (заменить старый)
 # Рядом, в корне репозитория, должен лежать rea_schedule_to_ics.py
 name: Update schedule
 
@@ -30,5 +30,5 @@ jobs:
         run: |
           git config user.name "schedule-bot"
           git config user.email "schedule-bot@users.noreply.github.com"
-          git add schedule.ics
+          git add schedule.ics teachers_cache.json
           git diff --cached --quiet || (git commit -m "Update schedule" && git push)
