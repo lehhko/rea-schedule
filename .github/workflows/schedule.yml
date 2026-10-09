@@ -24,7 +24,7 @@ jobs:
 
       # Если ничего не нашлось, скрипт завершится с ошибкой
       # и старый schedule.ics останется нетронутым.
-      - run: python rea_schedule_to_ics.py --alarm 30 --out schedule.ics
+      - run: python rea_schedule_to_ics.py --from-week 1 --to-week 45 --alarm 30 --out schedule.ics
 
       - name: Commit result
         run: |
